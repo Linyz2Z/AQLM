@@ -93,6 +93,20 @@ def is_model_for_causal_lm(model: nn.Module):
     return True
 
 
+def untie_word_embeddings(model: transformers.PreTrainedModel) -> bool:
+    """Give lm_head an independent weight when the base config ties it to embeddings."""
+    input_embeddings = model.get_input_embeddings()
+    output_embeddings = model.get_output_embeddings()
+    if output_embeddings is None or output_embeddings.weight is not input_embeddings.weight:
+        return False
+    output_embeddings.weight = nn.Parameter(
+        output_embeddings.weight.detach().clone(),
+        requires_grad=output_embeddings.weight.requires_grad,
+    )
+    model.config.tie_word_embeddings = False
+    return True
+
+
 def get_model_head_with_norm(model):
     head = torch.nn.ModuleList()
     if model.config.model_type in (*LLAMA_LIKE, "phi3"):
@@ -228,7 +242,15 @@ def load_linear_layers(layer, quant_layer, model):
                                     .data.to(child_module.weight.dtype)
                                     .to(child_module.weight.device)
                                 )
-                            # Bias is not taked into account
+                                if child_module.bias is not None:
+                                    if quant_child_module.bias is None:
+                                        raise RuntimeError(f"Missing bias for quantized layer {child_name}")
+                                    child_module.bias.data.copy_(
+                                        quant_child_module.bias.data.to(
+                                            dtype=child_module.bias.dtype,
+                                            device=child_module.bias.device,
+                                        )
+                                    )
     return layer
 
 
@@ -238,13 +260,20 @@ def load_dequantized_model(model, load_path):
     for layer_index in range(len(layers)):
         print("layer", layer_index)
         layer = layers[layer_index]
-        quant_layer = torch.load(os.path.join(load_path, str(layer_index) + ".pth"), map_location="cpu")
+        # AQLM layer checkpoints contain pickled nn.Module objects rather than
+        # tensor-only state dicts. PyTorch >= 2.6 defaults to weights_only=True.
+        quant_layer = torch.load(
+            os.path.join(load_path, str(layer_index) + ".pth"),
+            map_location="cpu",
+            weights_only=False,
+        )
         for module in quant_layer.modules():
             if isinstance(module, QuantizedWeight):
                 if not hasattr(module, "codes_storage"):
                     module.codes_storage = None  # backwards compatibility
         layers[layer_index] = load_linear_layers(layer, quant_layer, model)
-    model.load_state_dict(torch.load(os.path.join(load_path, "not_quantized_weights.pt")), strict=False)
+    untie_word_embeddings(model)
+    model.load_state_dict(torch.load(os.path.join(load_path, "not_quantized_weights.pt"), weights_only=False), strict=False)
     return model
 
 
@@ -255,13 +284,15 @@ def load_quantized_model(model, load_path):
         model.model.layers[layer_index] = torch.load(
             os.path.join(load_path, str(layer_index) + ".pth"),
             map_location=model.model.layers[layer_index].input_layernorm.weight.device,
+            weights_only=False,
         )
         for module in model.model.layers[layer_index].modules():
             if isinstance(module, QuantizedWeight):
                 if not hasattr(module, "codes_storage"):
                     module.codes_storage = None  # backwards compatibility
 
-    model.load_state_dict(torch.load(os.path.join(load_path, "not_quantized_weights.pt")), strict=False)
+    untie_word_embeddings(model)
+    model.load_state_dict(torch.load(os.path.join(load_path, "not_quantized_weights.pt"), weights_only=False), strict=False)
     return model
 
 

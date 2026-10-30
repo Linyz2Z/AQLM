@@ -13,7 +13,7 @@ import transformers.models
 from torch import nn
 
 from src.aq import QuantizedLinear, QuantizedWeight
-from src.modelutils import get_model, save_quantized_model
+from src.modelutils import get_model, save_quantized_model, untie_word_embeddings
 from src.utils import is_signed
 
 
@@ -69,12 +69,13 @@ def rgetattr(obj, attr, *args):
 
 def load_quantized_model_from_fdsp_checkpoint(base_model_name: str, fsdp_checkpoint_path: str, **kwargs):
     original_model = get_model(base_model_name, None, **kwargs)
+    untie_word_embeddings(original_model)
 
     state_filenames = os.listdir(fsdp_checkpoint_path)
 
     non_quant_fname = "non_quantized_state_dict.pth"
     non_quant_path = os.path.join(fsdp_checkpoint_path, non_quant_fname)
-    non_quant_states = torch.load(non_quant_path)
+    non_quant_states = torch.load(non_quant_path, map_location="cpu", weights_only=False)
 
     incomp_keys = original_model.load_state_dict(non_quant_states, strict=False)
     assert not incomp_keys.unexpected_keys
@@ -84,7 +85,6 @@ def load_quantized_model_from_fdsp_checkpoint(base_model_name: str, fsdp_checkpo
         if not isinstance(module, nn.Linear):
             continue
 
-        assert not module.bias
         state_fname = f"{module_name}.weight.pth"
 
         if state_fname not in state_filenames:
@@ -92,8 +92,8 @@ def load_quantized_model_from_fdsp_checkpoint(base_model_name: str, fsdp_checkpo
             continue
 
         state_path = os.path.join(fsdp_checkpoint_path, state_fname)
-        quantized_weight = torch.load(state_path, map_location="cpu")
-        quantized_linear = QuantizedLinear(quantized_weight, bias=None)
+        quantized_weight = torch.load(state_path, map_location="cpu", weights_only=False)
+        quantized_linear = QuantizedLinear(quantized_weight, bias=module.bias)
         rsetattr(original_model, module_name, quantized_linear)
 
     return original_model
@@ -164,7 +164,15 @@ def main():
     args.load_dtype = getattr(torch, args.load_dtype) if args.load_dtype != "auto" else "auto"
     args.code_dtype = getattr(torch, args.code_dtype) if args.code_dtype is not None else None
 
-    if not args.monkeypatch_old_pickle:
+    if args.pv_fsdp_dir:
+        quantized_model = load_quantized_model_from_fdsp_checkpoint(
+            args.base_model,
+            args.pv_fsdp_dir,
+            dtype=args.load_dtype,
+            trust_remote_code=args.trust_remote_code,
+            attn_implementation=args.attn_implementation,
+        )
+    elif not args.monkeypatch_old_pickle:
         quantized_model = get_model(
             args.base_model,
             args.quantized_model,
@@ -180,14 +188,6 @@ def main():
             trust_remote_code=args.trust_remote_code,
             attn_implementation=args.attn_implementation,
         )
-    elif args.pv_fsdp_dir:
-        quantized_model = load_quantized_model_from_fdsp_checkpoint(
-            args.base_model,
-            args.pv_fsdp_dir,
-            dtype=args.load_dtype,
-            trust_remote_code=args.trust_remote_code,
-        )
-
     for module in quantized_model.modules():
         if isinstance(module, QuantizedWeight):
             if not hasattr(module, "codes_storage"):

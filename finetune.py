@@ -3,7 +3,9 @@ Fine-tune an LLM that was previously quantized with AQLM;
 based on https://github.com/huggingface/transformers/blob/main/examples/pytorch/language-modeling/run_clm.py
 """
 import argparse
+import json
 import os
+import uuid
 from contextlib import nullcontext
 from functools import partial
 from typing import Dict, Optional, Tuple
@@ -348,6 +350,10 @@ def add_finetuning_args(parser: argparse.ArgumentParser):
     )
     parser.add_argument("--wandb", action="store_true", help="Whether to use wandb or store locally.")
     parser.add_argument("--save", type=str, default=None, help="Path to save training snapshot.")
+    parser.add_argument("--export_best_checkpoint", action="store_true",
+                        help="Export the best PV local checkpoint with the original world size; skip training.")
+    parser.add_argument("--defer_best_export", action="store_true",
+                        help="Leave the best PV checkpoint for a separate --export_best_checkpoint run.")
     parser.add_argument(
         "--max_epochs",
         type=int,
@@ -575,6 +581,21 @@ def load_student_model(
             attn_implementation=args.attn_implementation,
         ).to(args.master_dtype)
 
+    input_embeddings = student_model.get_input_embeddings()
+    output_embeddings = student_model.get_output_embeddings()
+    if output_embeddings.weight is input_embeddings.weight:
+        # FSDP wraps the base model and lm_head separately below. A parameter
+        # shared by those two FSDP instances gets incompatible flat and matrix
+        # gradient views during backward, so give lm_head its own initialized
+        # copy before either module is wrapped.
+        output_embeddings.weight = nn.Parameter(
+            output_embeddings.weight.detach().clone(),
+            requires_grad=output_embeddings.weight.requires_grad,
+        )
+        student_model.config.tie_word_embeddings = False
+        if torch.distributed.get_rank() == 0:
+            print("Untied student input embeddings and lm_head for FSDP compatibility")
+
     if args.embed_dtype != args.master_dtype:
         student_model.set_output_embeddings(student_model.get_output_embeddings().to(args.embed_dtype))
         student_model.set_input_embeddings(student_model.get_input_embeddings().to(args.embed_dtype))
@@ -583,7 +604,9 @@ def load_student_model(
     student_model.train(True)  # note: HF gradient checkpoints do not work for some models without train(True); see
     # https://github.com/huggingface/transformers/blob/2d92db8/src/transformers/models/llama/modeling_llama.py#L1006
     if args.gradient_checkpointing:
-        student_model.gradient_checkpointing_enable()
+        student_model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
         student_model.enable_input_require_grads()
 
     # convert QuantizedModel state dict to make it compatible with FSDP
@@ -598,8 +621,10 @@ def load_student_model(
     assert any(isinstance(module, IntCodes) for module in student_model.modules())
 
     if dequantize:
+        # Match master parameter storage dtype so FSDP can flatten weights
+        # together with reused biases; AMP controls forward computation only.
         student_model, named_quantized_params = create_dequantized_model(
-            student_model, dequantized_dtype=args.amp_dtype, reuse_non_quantized=True
+            student_model, dequantized_dtype=args.master_dtype, reuse_non_quantized=True
         )
     else:
         named_quantized_params = None
@@ -640,6 +665,8 @@ def load_student_model(
     student_model = wrap_model_with_fsdp_(
         student_model,
         use_orig_params=True,
+        # Disable backward prefetch while validating checkpointed distributed training.
+        backward_prefetch=None,
         auto_wrap_policy=lambda module, recurse, **_etc: recurse or isinstance(module, block_types_to_wrap),
         cpu_offload=CPUOffload(offload_params=args.offload_student_params) if args.offload_student_params else None,
         limit_all_gathers=args.limit_all_gathers,
@@ -838,14 +865,23 @@ def load_training_state(
 ):
     """Load model, optimizer state dict and metadata saved via save_training_state; update parameters in-place"""
     rank = torch.distributed.get_rank()
-    if args.save is None or not os.path.exists(args.save):
+    required = ["metadata.pt"] + [
+        f"{kind}_state_dict_rank{r}.pt"
+        for r in range(torch.distributed.get_world_size())
+        for kind in ("quantized_model", "optimizer")
+    ]
+    present = [name for name in required if args.save and os.path.isfile(os.path.join(args.save, name))]
+    if present and len(present) != len(required):
+        raise FileNotFoundError(f"Incomplete training snapshot in {args.save}: "
+                                f"missing {sorted(set(required) - set(present))}")
+    if not present:
         if args.save is not None and rank == 0:
             print(f"No checkpoint found at {args.save}")
     else:
         with FullyShardedDataParallel.state_dict_type(quantized_model, StateDictType.LOCAL_STATE_DICT):
             # this loads non-quantized weights and de-quantized versions of QuantizedWeight instances
             state_dict_ptr = quantized_model.state_dict()
-            loaded_state_dict = torch.load(os.path.join(args.save, f"quantized_model_state_dict_rank{rank}.pt"))
+            loaded_state_dict = torch.load(os.path.join(args.save, f"quantized_model_state_dict_rank{rank}.pt"), weights_only=False)
             with torch.no_grad():
                 for key in state_dict_ptr:
                     state_dict_ptr[key].copy_(loaded_state_dict.pop(key))
@@ -854,9 +890,9 @@ def load_training_state(
 
         # v-- loading optimizer state dict also loads all QuantizedWeights and straight-through buffers
         optimizer.load_state_dict(
-            torch.load(os.path.join(args.save, f"optimizer_state_dict_rank{rank}.pt"), map_location="cpu")
+            torch.load(os.path.join(args.save, f"optimizer_state_dict_rank{rank}.pt"), map_location="cpu", weights_only=False)
         )
-        metadata.update(torch.load(os.path.join(args.save, "metadata.pt")))
+        metadata.update(torch.load(os.path.join(args.save, "metadata.pt"), weights_only=False))
         if args.eval_datasets is not None and metadata["early_stop_on"] not in args.eval_datasets:
             if rank == 0:
                 print(f"Stopping criterion {metadata['early_stop_on']} is not in eval_datasets; resetting best loss.")
@@ -865,6 +901,77 @@ def load_training_state(
             metadata["best_step"] = 0
         if rank == 0:
             print(f"Loaded training state from {args.save}: {metadata}")
+
+
+def save_best_pv_checkpoint(args, metadata, student_model, optimizer):
+    """Publish only after every rank has written its local training state."""
+    rank = torch.distributed.get_rank()
+    root = os.path.join(args.save, "best_checkpoint")
+    generation = [f"step_{metadata['best_step']}_{uuid.uuid4().hex}" if rank == 0 else None]
+    torch.distributed.broadcast_object_list(generation, src=0)
+    checkpoint_args = argparse.Namespace(**vars(args))
+    checkpoint_args.save = os.path.join(root, generation[0])
+    checkpoint_args.on_save = None
+    save_training_state(checkpoint_args, metadata, student_model, optimizer)
+    torch.distributed.barrier()
+    if rank == 0:
+        manifest = {
+            "directory": generation[0], "world_size": torch.distributed.get_world_size(),
+            "best_step": metadata["best_step"],
+            "args": {key: str(value) if isinstance(value, torch.dtype) else value
+                     for key, value in vars(args).items()},
+        }
+        with open(os.path.join(root, "latest.json.tmp"), "w") as stream:
+            json.dump(manifest, stream, indent=2)
+        os.replace(os.path.join(root, "latest.json.tmp"), os.path.join(root, "latest.json"))
+        print(f"Saved best PV local checkpoint to {checkpoint_args.save}", flush=True)
+    torch.distributed.barrier()
+
+
+def restore_best_pv_checkpoint(args, student_model, optimizer):
+    root = os.path.join(args.save, "best_checkpoint")
+    with open(os.path.join(root, "latest.json")) as stream:
+        manifest = json.load(stream)
+    if manifest["world_size"] != torch.distributed.get_world_size():
+        raise ValueError(f"Best checkpoint requires world_size={manifest['world_size']}")
+    checkpoint_args = argparse.Namespace(**vars(args))
+    checkpoint_args.save = os.path.join(root, manifest["directory"])
+    checkpoint_args.eval_datasets = None
+    world_size = manifest["world_size"]
+    required = ["metadata.pt"] + [
+        f"{kind}_state_dict_rank{rank}.pt"
+        for rank in range(world_size) for kind in ("quantized_model", "optimizer")
+    ]
+    missing = [name for name in required if not os.path.isfile(os.path.join(checkpoint_args.save, name))]
+    if missing:
+        raise FileNotFoundError(f"Incomplete best checkpoint: {missing}")
+    load_training_state(checkpoint_args, {}, student_model, optimizer)
+    torch.distributed.barrier()
+
+
+def export_best_pv_checkpoint(save_path, device):
+    """Export using the saved configuration, without loading teacher or datasets."""
+    if save_path is None:
+        raise ValueError("Export requires a checkpoint directory")
+    args = argparse.Namespace(save=save_path)
+    world_size = torch.distributed.get_world_size()
+    with open(os.path.join(args.save, "best_checkpoint", "latest.json")) as stream:
+        manifest = json.load(stream)
+    if manifest["world_size"] != world_size:
+        raise ValueError(f"Export requires world_size={manifest['world_size']}")
+    # Reuse the saved training configuration to preserve wrapping, dtypes,
+    # quantized-weight ownership and optimizer parameter groups.
+    export_args = argparse.Namespace(**manifest["args"])
+    export_args.save = args.save
+    for key, value in vars(export_args).items():
+        if isinstance(value, str) and value.startswith("torch."):
+            setattr(export_args, key, getattr(torch, value.removeprefix("torch.")))
+    with one_rank_at_a_time(local=True, group_size=export_args.limit_parallel_inits):
+        student_model, quantized_params = load_student_model(export_args, device, dequantize=True)
+    optimizer = create_pv_optimizer(export_args, student_model, quantized_params)
+    restore_best_pv_checkpoint(export_args, student_model, optimizer)
+    save_pv_model(export_args, student_model, optimizer)
+    torch.distributed.barrier()
 
 
 def save_model(args: argparse.Namespace, student_model: FullyShardedDataParallel, optimizer: torch.optim.Optimizer):
@@ -975,17 +1082,86 @@ def compute_loss_on_batch(
 def compute_validation_perplexities(args: argparse.Namespace, model: nn.Module, eval_datasets: dict):
     rank = torch.distributed.get_rank()
     perplexities = {}
-    for dataset_name, eval_dataset in eval_datasets.items():
-        if rank == 0:
-            print(f"Evaluating perplexity on {dataset_name} ...")
-        device = next(model.parameters()).device
-        original_dtype = args.load_dtype if args.load_dtype != "auto" else None
-        amp_dtype = args.amp_dtype if args.amp_dtype is not None else original_dtype
-        ppl = evaluate_perplexity(model, eval_dataset, args.model_seqlen, device=device, amp_dtype=amp_dtype)
-        if rank == 0:
-            print(f"{dataset_name} perplexity: {ppl:.9f}")
-        perplexities[dataset_name] = ppl
+    was_training = model.training
+    model.eval()
+    try:
+        for dataset_name, eval_dataset in eval_datasets.items():
+            if rank == 0:
+                print(f"Evaluating perplexity on {dataset_name} ...")
+            device = next(model.parameters()).device
+            original_dtype = args.load_dtype if args.load_dtype != "auto" else None
+            amp_dtype = args.amp_dtype if args.amp_dtype is not None else original_dtype
+            ppl = evaluate_perplexity(model, eval_dataset, args.model_seqlen, device=device, amp_dtype=amp_dtype)
+            if rank == 0:
+                print(f"{dataset_name} perplexity: {ppl:.9f}")
+            perplexities[dataset_name] = ppl
+    finally:
+        model.train(was_training)
     return perplexities
+
+
+def evaluate_final_model(
+    args: argparse.Namespace,
+    student_model: FullyShardedDataParallel,
+    optimizer: torch.optim.Optimizer,
+    eval_datasets: dict,
+):
+    """Reload and evaluate the saved best model, leaving training checkpoints intact."""
+    rank = torch.distributed.get_rank()
+    if args.save is None or not args.keep_best_model:
+        if rank == 0:
+            print("Skipping final best-model evaluation: --save and --keep_best_model are required")
+        return {}
+
+    torch.distributed.barrier()
+    is_pv = isinstance(optimizer, StraightThroughAdamW)
+    checkpoint_path = (
+        os.path.join(args.save, "best_model", "non_quantized_state_dict.pth")
+        if is_pv
+        else os.path.join(args.save, "best_model_state_dict.pt")
+    )
+    if not os.path.isfile(checkpoint_path):
+        if rank == 0:
+            print(f"Skipping final best-model evaluation: no saved best model at {checkpoint_path}")
+        return {}
+
+    # Each rank reads the full CPU state so FSDP can restore its local shards.
+    # PV exports omit dense quantized weights; reconstruct them from the saved
+    # QuantizedWeight objects, never from the optimizer's last training state.
+    saved_state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if is_pv:
+        with torch.no_grad():
+            for name in optimizer.ordered_quantized_weight_names:
+                weight_path = os.path.join(args.save, "best_model", f"{name}.pth")
+                quantized_weight = torch.load(weight_path, map_location="cpu", weights_only=False)
+                saved_state[name] = quantized_weight().detach()
+                del quantized_weight
+
+    with FullyShardedDataParallel.state_dict_type(
+        student_model,
+        StateDictType.FULL_STATE_DICT,
+        state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
+    ):
+        student_model.load_state_dict(saved_state, strict=True)
+    del saved_state
+    if rank == 0:
+        print(f"Evaluating saved best model from {checkpoint_path}")
+
+    scores = compute_validation_perplexities(args, student_model, eval_datasets)
+    if rank == 0:
+        if args.save is not None:
+            output_path = os.path.join(args.save, "final_perplexities.json")
+            with open(output_path, "w") as output_file:
+                json.dump(
+                    {"checkpoint": checkpoint_path, "model_seqlen": args.model_seqlen, "perplexities": scores},
+                    output_file,
+                    indent=2,
+                )
+                output_file.write("\n")
+            print(f"Saved final perplexity results to {output_path}")
+        if args.wandb:
+            wandb.log({f"final_perplexity_{name}": value for name, value in scores.items()})
+    return scores
 
 
 def main():
@@ -1027,6 +1203,10 @@ def main():
         assert args.save is not None, f"--keep_best_model requires --save path"
         assert args.eval_every_steps is not None, f"--keep_best_model requires --eval_every_steps"
         assert args.eval_datasets is not None, f"--keep_best_model requires --eval_datasets"
+
+    if args.export_best_checkpoint:
+        export_best_pv_checkpoint(args.save, device)
+        return
 
     if args.wandb and rank == 0:
         assert has_wandb, "`wandb` not installed, try pip install `wandb`"
@@ -1166,10 +1346,13 @@ def main():
                     if perplexity_scores[metric_name] < metadata["best_eval_perplexity"]:
                         if rank == 0:
                             print(f"New best perplexity ({metric_name}) = {perplexity_scores[metric_name]:.9f}")
-                        metadata["best_eval_perplexity"] = perplexity_scores[args.eval_datasets[0]]
+                        metadata["best_eval_perplexity"] = perplexity_scores[metric_name]
                         metadata["best_step"] = metadata["total_optimizer_steps"]
                         if args.keep_best_model:
-                            save_model(args, student_model, optimizer)
+                            if use_pv_tuning:
+                                save_best_pv_checkpoint(args, metadata, student_model, optimizer)
+                            else:
+                                save_model(args, student_model, optimizer)
                 if args.wandb and rank == 0:
                     wandb.log(metadata, step=metadata["total_microbatches"])
                 if args.save_every_steps and metadata["total_optimizer_steps"] % args.save_every_steps == 0:
@@ -1179,6 +1362,14 @@ def main():
         metadata["current_epoch"] += 1
 
     save_training_state(args, metadata, student_model, optimizer)
+    if use_pv_tuning and args.keep_best_model:
+        if args.defer_best_export:
+            if rank == 0:
+                print("Best PV checkpoint saved; run with --export_best_checkpoint to export.")
+            return
+        restore_best_pv_checkpoint(args, student_model, optimizer)
+        save_pv_model(args, student_model, optimizer)
+    evaluate_final_model(args, student_model, optimizer, eval_datasets)
 
 
 if __name__ == "__main__":

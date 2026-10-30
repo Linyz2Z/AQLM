@@ -71,7 +71,9 @@ def _compute_kl_div_from_flat_hidden_states(
 
 def maybe_checkpoint(func: Callable[[...], T], *inputs, checkpoint_enabled: bool, **checkpoint_kwargs) -> T:
     """Execute function normally or with checkpointing, depending on checkpoint_enabled. Forward **checkpoint_kwargs"""
-    return func(*inputs) if checkpoint_enabled else checkpoint(func, *inputs, **checkpoint_kwargs)
+    if checkpoint_enabled:
+        return checkpoint(func, *inputs, **checkpoint_kwargs)
+    return func(*inputs)
 
 
 def test_kl_divergence(

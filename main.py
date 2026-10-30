@@ -135,26 +135,39 @@ def get_inps(
     layers[0] = Catcher(layers[0])
     saved_num_threads = torch.get_num_threads()
     torch.set_num_threads(min(16, saved_num_threads))
-    for batch_inps in data:
-        try:
-            if isinstance(batch_inps, (list, tuple)):
-                batch_inps, *_ = batch_inps
-            batch_inps = batch_inps.to(device)
-            # call model.forward to trigger the Catcher
-            model(batch_inps, attention_mask=torch.ones_like(batch_inps))
-        except CatcherExit:
-            pass  # exit after catcher finished without running the rest of the model layers
+    # Newer Llama implementations compute model-level RoPE before the first
+    # decoder layer. Move it alongside the embeddings only when it exists.
+    rotary_emb = getattr(getattr(model, "model", None), "rotary_emb", None)
+    rotary_device = None
+    if isinstance(rotary_emb, nn.Module):
+        rotary_tensor = next(chain(rotary_emb.buffers(), rotary_emb.parameters()), None)
+        if rotary_tensor is not None:
+            rotary_device = rotary_tensor.device
 
-    torch.set_num_threads(saved_num_threads)
-    layers[0] = layers[0].module
-
-    layers[0] = layers[0].to(layer_device)
-    model.get_input_embeddings().to(emb_device)
-    if model.config.model_type == "opt":
-        model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(emb_device)
-        if hasattr(model.model.decoder, "project_in") and model.model.decoder.project_in:
-            model.model.decoder.project_in = model.model.decoder.project_in.to(emb_device)
-    torch.cuda.empty_cache()
+    try:
+        if rotary_device is not None:
+            rotary_emb.to(device)
+        for batch_inps in data:
+            try:
+                if isinstance(batch_inps, (list, tuple)):
+                    batch_inps, *_ = batch_inps
+                batch_inps = batch_inps.to(device)
+                # call model.forward to trigger the Catcher
+                model(batch_inps, attention_mask=torch.ones_like(batch_inps))
+            except CatcherExit:
+                pass  # exit without running the rest of the model layers
+    finally:
+        torch.set_num_threads(saved_num_threads)
+        layers[0] = layers[0].module
+        layers[0] = layers[0].to(layer_device)
+        model.get_input_embeddings().to(emb_device)
+        if rotary_device is not None:
+            rotary_emb.to(rotary_device)
+        if model.config.model_type == "opt":
+            model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(emb_device)
+            if hasattr(model.model.decoder, "project_in") and model.model.decoder.project_in:
+                model.model.decoder.project_in = model.model.decoder.project_in.to(emb_device)
+        torch.cuda.empty_cache()
 
     forward_args = {k: cache[k] for k in forward_arg_names}
     assert cache["i"] == sum(len(inp_tensor) for inp_tensor in inps), "internal error: found empty rows in inps"
@@ -210,7 +223,8 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
             layer_save_path = os.path.join(args.save, f"{layer_index}.pth")
             if os.path.exists(layer_save_path):
                 print(f"Loading layer {layer_index} from {layer_save_path}")
-                layer = torch.load(layer_save_path, map_location=args.devices[0])
+                # Saved AQLM layers are complete pickled nn.Module objects.
+                layer = torch.load(layer_save_path, map_location=args.devices[0], weights_only=False)
                 loaded_layer = True
 
         # prepare validation  outputs

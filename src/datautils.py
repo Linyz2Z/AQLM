@@ -1,8 +1,10 @@
 import os
 import random
+from glob import glob
 from itertools import chain
 from typing import Optional, Sequence
 
+import datasets
 import numpy as np
 import torch
 import torch.distributed
@@ -10,7 +12,7 @@ from datasets import load_dataset
 from torch import nn
 from tqdm import trange
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, LlamaTokenizer
 
 
 def set_seed(seed: Optional[int]):
@@ -19,10 +21,55 @@ def set_seed(seed: Optional[int]):
     torch.random.manual_seed(seed)
 
 
+def _load_wikitext2_split(split: str):
+    cache_dirs = [
+        os.environ.get("HF_DATASETS_CACHE"),
+        datasets.config.HF_DATASETS_CACHE,
+        os.path.expanduser("~/.cache/huggingface/datasets"),
+    ]
+    for cache_dir in dict.fromkeys(path for path in cache_dirs if path):
+        arrow_files = glob(
+            os.path.join(cache_dir, "wikitext", "wikitext-2-raw-v1", "**", f"wikitext-{split}.arrow"),
+            recursive=True,
+        )
+        if arrow_files:
+            return datasets.Dataset.from_file(arrow_files[0])
+
+    return load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
+
+
+def _load_c4_split(split: str):
+    cache_dirs = [
+        os.environ.get("HF_DATASETS_CACHE"),
+        datasets.config.HF_DATASETS_CACHE,
+        os.path.expanduser("~/.cache/huggingface/datasets"),
+    ]
+    for cache_dir in dict.fromkeys(path for path in cache_dirs if path):
+        arrow_files = sorted(
+            glob(os.path.join(cache_dir, "allenai___c4", "**", f"c4-{split}*.arrow"), recursive=True)
+        )
+        if arrow_files:
+            if len(arrow_files) == 1:
+                return datasets.Dataset.from_file(arrow_files[0])
+            return datasets.concatenate_datasets([datasets.Dataset.from_file(path) for path in arrow_files])
+
+    data_files = {
+        "train": "en/c4-train.00000-of-01024.json.gz",
+        "validation": "en/c4-validation.00000-of-00008.json.gz",
+    }
+    return load_dataset(
+        "allenai/c4",
+        "default",
+        data_files={split: data_files[split]},
+        split=split,
+        revision="607bd4c8450a42878aa9ddc051a65a055450ef87",
+    )
+
+
 def get_red_pajama(nsamples, seqlen, tokenizer, eval_mode=False):
-    print("Loading red_pajama from togethercomputer/RedPajama-Data-1T-Sample")
+    print("Loading red_pajama from ZengXiangyu/RedPajama-Data-1T-Sample")
     assert not eval_mode, "Only train set is supported in RedPajama"
-    traindata = load_dataset("togethercomputer/RedPajama-Data-1T-Sample", split="train")
+    traindata = load_dataset("ZengXiangyu/RedPajama-Data-1T-Sample", split="train")
     tokenizer.bos_token_id = 1
     tokenizer.eos_token_id = 2
     trainloader = []
@@ -42,7 +89,7 @@ def get_red_pajama(nsamples, seqlen, tokenizer, eval_mode=False):
 
 def get_wikitext2(nsamples, seqlen, tokenizer, eval_mode=False):
     if not eval_mode:
-        traindata = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+        traindata = _load_wikitext2_split("train")
         trainenc = tokenizer("\n\n".join(traindata["text"]), return_tensors="pt")
         trainloader = []
         for _ in range(nsamples):
@@ -52,7 +99,7 @@ def get_wikitext2(nsamples, seqlen, tokenizer, eval_mode=False):
             trainloader.append(inp)
         return trainloader
     else:
-        testdata = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+        testdata = _load_wikitext2_split("test")
         testenc = tokenizer("\n\n".join(testdata["text"]), return_tensors="pt")
         return testenc
 
@@ -76,13 +123,7 @@ def get_ptb(nsamples, seqlen, tokenizer, eval_mode=False):
 
 def get_c4(nsamples, seqlen, tokenizer, eval_mode=False):
     if not eval_mode:
-        traindata = load_dataset(
-            "allenai/c4",
-            "default",
-            data_files={"train": "en/c4-train.00000-of-01024.json.gz"},
-            split="train",
-            revision="607bd4c8450a42878aa9ddc051a65a055450ef87",
-        )
+        traindata = _load_c4_split("train")
         trainloader = []
         for _ in range(nsamples):
             while True:
@@ -97,13 +138,7 @@ def get_c4(nsamples, seqlen, tokenizer, eval_mode=False):
         return trainloader
 
     else:
-        valdata = load_dataset(
-            "allenai/c4",
-            "default",
-            data_files={"validation": "en/c4-validation.00000-of-00008.json.gz"},
-            split="validation",
-            revision="607bd4c8450a42878aa9ddc051a65a055450ef87",
-        )
+        valdata = _load_c4_split("validation")
         random.seed(0)
         valenc = []
         for _ in range(256):
@@ -142,13 +177,7 @@ def get_ptb_new(nsamples, seqlen, tokenizer, eval_mode=False):
 
 def get_c4_new(nsamples, seqlen, tokenizer, eval_mode=False):
     if not eval_mode:
-        traindata = load_dataset(
-            "allenai/c4",
-            "default",
-            data_files={"train": "en/c4-train.00000-of-01024.json.gz"},
-            split="train",
-            revision="607bd4c8450a42878aa9ddc051a65a055450ef87",
-        )
+        traindata = _load_c4_split("train")
         trainloader = []
         for _ in range(nsamples):
             while True:
@@ -162,13 +191,7 @@ def get_c4_new(nsamples, seqlen, tokenizer, eval_mode=False):
             trainloader.append(inp)
         return trainloader
     else:
-        valdata = load_dataset(
-            "allenai/c4",
-            "default",
-            data_files={"validation": "en/c4-validation.00000-of-00008.json.gz"},
-            split="validation",
-            revision="607bd4c8450a42878aa9ddc051a65a055450ef87",
-        )
+        valdata = _load_c4_split("validation")
         valenc = tokenizer(" ".join(valdata[:1100]["text"]), return_tensors="pt")
         valenc = valenc.input_ids[:, : (256 * seqlen)]
         return valenc
@@ -217,6 +240,7 @@ def get_loaders(
     elif os.path.isfile(name):
         try:
             data = torch.load(name)[:nsamples]
+
         except FileNotFoundError:
             raise FileNotFoundError(
                 f"Failed to load custom data from {name}.",
@@ -237,7 +261,7 @@ def get_loaders(
             data = get_ptb_new(nsamples, seqlen, tokenizer, eval_mode=eval_mode)
         elif name.lower() == "c4":
             data = get_c4(nsamples, seqlen, tokenizer, eval_mode=eval_mode)
-        elif name.lower() == "c4_new":
+        elif name.lower() in ("c4_new", "c4-new"):
             data = get_c4_new(nsamples, seqlen, tokenizer, eval_mode=eval_mode)
         else:
             raise ValueError(
